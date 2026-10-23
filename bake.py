@@ -166,7 +166,7 @@ def bake(project, video_path, out_path, log=print, progress=None, should_stop=No
 
     frames_t = torch.from_numpy(frames[:T_train]).to(dev)
     acts_t = torch.from_numpy(A[:T_train]).to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4, fused=(dev == "cuda"))
     ar = torch.arange(L + R, device=dev)
 
     def lr_at(s):
@@ -227,7 +227,7 @@ def bake(project, video_path, out_path, log=print, progress=None, should_stop=No
             w = 1 + 8 * ((tgt - prev_true).abs() > 0.04).float()   # где реально что-то изменилось — штраф больше
             loss = loss + (w * (pred - tgt).abs()).mean()
             if r == 0:
-                base = (w * (prev_true - tgt).abs()).mean().item()
+                base = (w * (prev_true - tgt).abs()).mean().detach()
             cur = torch.cat([cur[:, 1:], pred.detach().clamp(0, 1)[:, None]], 1)
         loss = loss / R_now
         opt.zero_grad(set_to_none=True)
@@ -235,15 +235,16 @@ def bake(project, video_path, out_path, log=print, progress=None, should_stop=No
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         done = step
-        lv = loss.item()
+        lv = loss.detach()
         ema = lv if ema is None else 0.98 * ema + 0.02 * lv
         ema_base = base if ema_base is None else 0.98 * ema_base + 0.02 * base
         if step % 50 == 0 or step == steps:
+            ema_f, base_f = float(ema), float(ema_base)   # единственная синхронизация
             el = time.time() - t_start
             eta = el / step * (steps - step)
-            progress(step, steps, ema, eta)
+            progress(step, steps, ema_f, eta)
             if step % 500 == 0:
-                log(f"шаг {step}/{steps}  ошибка {ema:.4f} (если просто копировать кадр: {ema_base:.4f})  "
+                log(f"шаг {step}/{steps}  ошибка {ema_f:.4f} (если просто копировать кадр: {base_f:.4f})  "
                     f"{step / el:.1f} шаг/с")
         if step % 1000 == 0:
             preview()
@@ -259,9 +260,10 @@ def bake(project, video_path, out_path, log=print, progress=None, should_stop=No
         "name": project.get("name", "model"), "fps": fps, "size": [W, H], "color": color,
         "actions": [{"name": a["name"], "key": a["key"]} for a in project["actions"]],
         "frames": T, "steps": done, "loss": round(float(ema or 0), 5),
-        "baseline": round(float(ema_base or 0), 5),
+        "baseline": round(float(ema_base) if ema_base is not None else 0.0, 5),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "video": project.get("video_name", ""),
+        "loss": round(float(ema) if ema is not None else 0.0, 5),
     }
     save_wm(out_path, mcfg, model, meta, seeds, seed_acts)
     log(f"Готово: {out_path} ({os.path.getsize(out_path) / 1e6:.1f} МБ)")

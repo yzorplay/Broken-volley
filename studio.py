@@ -5,6 +5,7 @@
 
 Разметка: запустите видео и ДЕРЖИТЕ клавишу действия, пока кнопка «нажата» в кадре.
 Проект сохраняется автоматически рядом с видео: <видео>.project.json
+Пресеты настроек запекания хранятся в presets.json рядом с программой.
 """
 import json
 import os
@@ -54,6 +55,12 @@ def read_json(path):
         except ValueError as e:
             last = e
     raise ValueError(f"{path}: не удалось прочитать JSON ({last})")
+
+
+def presets_path():
+    """presets.json лежит рядом с программой (для .exe — рядом с exe, а не во временной папке)."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "presets.json")
 
 
 def num(var, typ, name):
@@ -665,6 +672,19 @@ class App:
         ttk.Label(form, text="Устройство").grid(row=len(fields) + 2, column=0, sticky="w", padx=4, pady=4)
         ttk.Combobox(form, textvariable=self.dev_var, values=["auto", "gpu", "cpu"], width=7).grid(row=len(fields) + 2, column=1, padx=4)
 
+        # пресеты настроек
+        r = len(fields) + 3
+        ttk.Label(form, text="Пресет").grid(row=r, column=0, sticky="w", padx=4, pady=(8, 0))
+        self.preset_var = tk.StringVar()
+        self.preset_cb = ttk.Combobox(form, textvariable=self.preset_var, width=16, state="readonly")
+        self.preset_cb.grid(row=r, column=1, columnspan=2, sticky="w", padx=4, pady=(8, 0))
+        self.preset_cb.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+        pr = ttk.Frame(form)
+        pr.grid(row=r + 1, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        ttk.Button(pr, text="Сохранить…", command=self.save_preset, takefocus=False).pack(side="left", padx=2)
+        ttk.Button(pr, text="Удалить", command=self.delete_preset, takefocus=False).pack(side="left", padx=2)
+        self.refresh_presets()
+
         right = ttk.Frame(top)
         right.pack(side="left", fill="both", expand=True, padx=10)
         orow = ttk.Frame(right)
@@ -686,6 +706,76 @@ class App:
         self.logbox.pack(fill="both", expand=True)
         self.lbl_prev = ttk.Label(tab, text="Превью появится после первых 1000 шагов: сверху настоящее видео, снизу — что рисует модель сама")
         self.lbl_prev.pack(fill="x", padx=8, pady=4)
+
+    # пресеты
+
+    def _load_presets(self):
+        try:
+            data = read_json(presets_path())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_presets(self, data):
+        p = presets_path()
+        try:
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(p + ".tmp", p)
+        except OSError as e:
+            self.warn(f"Не удалось сохранить пресеты в {p}: {e}")
+
+    def refresh_presets(self, select=None):
+        names = sorted(self._load_presets())
+        self.preset_cb.config(values=names)
+        if select is not None:
+            self.preset_var.set(select)
+        elif self.preset_var.get() not in names:
+            self.preset_var.set("")
+
+    def save_preset(self):
+        try:
+            cfg = self._bake_cfg()
+        except ValueError as e:
+            self.err(str(e))
+            return
+        cfg.pop("crop")   # обрезка зависит от видео, в пресет не входит
+        name = simpledialog.askstring("Пресет", "Название пресета:", initialvalue=self.preset_var.get(), parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        data = self._load_presets()
+        if name in data and not messagebox.askyesno("Пресет", f"Пресет «{name}» уже есть. Перезаписать?"):
+            return
+        data[name] = cfg
+        self._write_presets(data)
+        self.refresh_presets(name)
+        self.status.set(f"Пресет «{name}» сохранён")
+
+    def apply_preset(self):
+        name = self.preset_var.get()
+        p = self._load_presets().get(name)
+        if not p:
+            return
+        cfg = {**bakemod.DEFAULTS, **p}
+        bv = self.bv
+        bv["w"].set(cfg["size"][0])
+        bv["h"].set(cfg["size"][1])
+        bv["color"].set(bool(cfg["color"]))
+        for k in ("ctx", "act_ctx", "width", "steps", "batch", "rollout", "lr"):
+            bv[k].set(cfg[k])
+        self.status.set(f"Применён пресет «{name}»")
+
+    def delete_preset(self):
+        name = self.preset_var.get()
+        data = self._load_presets()
+        if name not in data:
+            self.warn("Сначала выберите пресет в списке")
+            return
+        if messagebox.askyesno("Удалить", f"Удалить пресет «{name}»?"):
+            del data[name]
+            self._write_presets(data)
+            self.refresh_presets()
 
     def ask_out(self):
         p = filedialog.asksaveasfilename(title="Модель", defaultextension=".wm", filetypes=[("Модель мира", "*.wm")])
